@@ -32,7 +32,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 CURRENCY = "scream"
 
-# ============ ПРЕМИУМ ЭМОДЗИ TELEGRAM ============
+# Переключатель премиум эмодзи:
+# true — отправлять кастомные прем эмодзи
+# false — отправлять стандартные эмодзи (если у бота нет прав на прем эмодзи)
+ENABLE_PREMIUM_EMOJI = os.getenv("ENABLE_PREMIUM_EMOJI", "true").lower() in ("true", "1", "yes")
+
+# ============ ТВОИ ПРОВЕРЕННЫЕ АЙДИ ПРЕМИУМ ЭМОДЗИ ============
 PREMIUM_EMOJIS = {
     "casino":   "5431536464246634160",  # 🎰 Главный значок казика
     "fire":     "5188487846968732572",  # 🔥 Огонь / статус Профи
@@ -60,8 +65,15 @@ PREMIUM_EMOJIS = {
 }
 
 
+def strip_tg_emoji(text: str) -> str:
+    """Удаляет теги <tg-emoji id="...">...</tg-emoji>, оставляя сам эмодзи."""
+    return re.sub(r'<tg-emoji\s+id="[^"]*">([^<]+)</tg-emoji>', r'\1', text)
+
+
 def e(key: str, fallback: str) -> str:
-    """Генерирует HTML-тег для премиум-эмодзи Телеграма."""
+    """Генерирует премиум-эмодзи через официальный тег <tg-emoji>."""
+    if not ENABLE_PREMIUM_EMOJI:
+        return fallback
     custom_id = PREMIUM_EMOJIS.get(key, "").strip()
     if custom_id:
         return f'<tg-emoji id="{custom_id}">{fallback}</tg-emoji>'
@@ -76,6 +88,7 @@ if not BOT_TOKEN:
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -126,7 +139,7 @@ async def _pg_init_pool():
         clean_url,
         min_size=1,
         max_size=10,
-        ssl=False,  # Отключаем SSL для серверов без ssl upgrade
+        ssl=False,
         command_timeout=30,
     )
     print("[БД] Успешное подключение к PostgreSQL!")
@@ -447,21 +460,52 @@ def home_button() -> InlineKeyboardButton:
     return InlineKeyboardButton(text="🏠 Меню", callback_data="menu:home")
 
 
+async def safe_reply(message: Message, text: str, reply_markup=None):
+    """Отправляет сообщение, а в случае ошибки custom emoji — автоматически вычищает тег."""
+    try:
+        return await message.reply(text, reply_markup=reply_markup)
+    except TelegramBadRequest as err:
+        if "custom emoji" in str(err).lower():
+            clean_text = strip_tg_emoji(text)
+            return await message.reply(clean_text, reply_markup=reply_markup)
+        raise
+
+
+async def safe_answer(message: Message, text: str, reply_markup=None):
+    """Отвечает на сообщение с автозащитой от ошибок custom emoji."""
+    try:
+        return await message.answer(text, reply_markup=reply_markup)
+    except TelegramBadRequest as err:
+        if "custom emoji" in str(err).lower():
+            clean_text = strip_tg_emoji(text)
+            return await message.answer(clean_text, reply_markup=reply_markup)
+        raise
+
+
+async def safe_edit_text(message: Message, text: str, reply_markup=None):
+    """Редактирует сообщение с автозащитой от ошибок custom emoji."""
+    try:
+        return await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as err:
+        if "custom emoji" in str(err).lower():
+            clean_text = strip_tg_emoji(text)
+            return await message.edit_text(clean_text, reply_markup=reply_markup)
+        raise
+
+
 async def show(event: Event, text: str, kb: InlineKeyboardMarkup,
                edit: bool = True) -> None:
+    """Универсальная отправка и редактирование сообщений с защитой от сбоев."""
     if isinstance(event, CallbackQuery):
         if edit:
             try:
-                await event.message.edit_text(text, reply_markup=kb)
+                await safe_edit_text(event.message, text, reply_markup=kb)
                 return
             except Exception:
                 pass
-        await event.message.answer(
-            text, reply_markup=kb,
-            reply_to_message_id=event.message.message_id,
-        )
+        await safe_answer(event.message, text, reply_markup=kb)
     else:
-        await event.answer(text, reply_markup=kb)
+        await safe_answer(event, text, reply_markup=kb)
 
 
 async def show_alert(event: CallbackQuery, text: str) -> None:
@@ -1193,28 +1237,29 @@ async def handle_reply_pay(m: Message) -> bool:
 
     amount = int(match.group(1))
     if amount <= 0:
-        await m.reply("Сумма должна быть больше 0.")
+        await safe_reply(m, "Сумма должна быть больше 0.")
         return True
 
     target = m.reply_to_message.from_user
     if target.id == m.from_user.id:
-        await m.reply("Самому себе переводить нельзя 🤡")
+        await safe_reply(m, "Самому себе переводить нельзя 🤡")
         return True
     if target.is_bot:
-        await m.reply("Боту? Ты серьёзно? 🤖")
+        await safe_reply(m, "Боту? Ты серьёзно? 🤖")
         return True
 
     ok = await try_deduct_balance(m.from_user.id, amount)
     if not ok:
         sender = await get_user(m.from_user.id)
-        await m.reply(f"💸 У тебя только <b>{fmt(sender['balance'])}</b> {CURRENCY}, "
-                      f"а ты пытаешься кинуть {fmt(amount)}.")
+        await safe_reply(m, f"💸 У тебя только <b>{fmt(sender['balance'])}</b> {CURRENCY}, "
+                            f"а ты пытаешься кинуть {fmt(amount)}.")
         return True
 
     await get_user(target.id, target.username, target.first_name)
     await add_balance(target.id, amount)
 
-    await m.reply(
+    await safe_reply(
+        m,
         f"{e('money', '💸')} <b>{fmt(amount)} {CURRENCY}</b> успешно улетели от "
         f"@{m.from_user.username or m.from_user.first_name} "
         f"к @{target.username or target.first_name} {e('check', '✅')}")
@@ -1233,7 +1278,8 @@ async def handle_chat_balance(m: Message) -> bool:
         return True
 
     u = await get_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
-    await m.reply(
+    await safe_reply(
+        m,
         f"{e('bag', '💼')} <b>@{m.from_user.username or m.from_user.first_name}</b>, "
         f"твой баланс: <b>{fmt(u['balance'])} {CURRENCY}</b>"
     )
@@ -1274,27 +1320,28 @@ async def handle_chat_trigger(m: Message) -> bool:
 
 async def chat_joker(m: Message, args: list[str]):
     if not args or not args[0].isdigit():
-        await m.reply("🃏 Формат: <code>джокер 500</code>")
+        await safe_reply(m, "🃏 Формат: <code>джокер 500</code>")
         return
     bet = int(args[0])
     if bet < 100:
-        await m.reply(f"🃏 Минимум 100 {CURRENCY}")
+        await safe_reply(m, f"🃏 Минимум 100 {CURRENCY}")
         return
 
     ok = await try_deduct_balance(m.from_user.id, bet)
     if not ok:
         u = await get_user(m.from_user.id)
-        await m.reply(f"💸 У тебя {fmt(u['balance'])} {CURRENCY}, ставишь {fmt(bet)}")
+        await safe_reply(m, f"💸 У тебя {fmt(u['balance'])} {CURRENCY}, ставишь {fmt(bet)}")
         return
     if await get_game(m.from_user.id):
         await add_balance(m.from_user.id, bet)
-        await m.reply("🎮 Ты уже играешь!")
+        await safe_reply(m, "🎮 Ты уже играешь!")
         return
 
     await stat_bet(m.from_user.id, bet)
     state = joker_new_state(bet)
     await save_game(m.from_user.id, "joker", bet, state)
-    await m.reply(
+    await safe_reply(
+        m,
         f"🃏 <b>@{m.from_user.username or m.from_user.first_name}</b> "
         f"ставит <b>{fmt(bet)} {CURRENCY}</b>\n\n" + joker_text(state),
         reply_markup=joker_kb(m.from_user.id, state))
@@ -1302,27 +1349,28 @@ async def chat_joker(m: Message, args: list[str]):
 
 async def chat_mines(m: Message, args: list[str]):
     if not args or not args[0].isdigit():
-        await m.reply("💣 Формат: <code>мины 100</code>\n└ 5 мин на поле")
+        await safe_reply(m, "💣 Формат: <code>мины 100</code>\n└ 5 мин на поле")
         return
     bet = int(args[0])
     if bet < 100:
-        await m.reply(f"💣 Минимум 100 {CURRENCY}")
+        await safe_reply(m, f"💣 Минимум 100 {CURRENCY}")
         return
 
     ok = await try_deduct_balance(m.from_user.id, bet)
     if not ok:
         u = await get_user(m.from_user.id)
-        await m.reply(f"💸 У тебя только {fmt(u['balance'])} {CURRENCY}")
+        await safe_reply(m, f"💸 У тебя только {fmt(u['balance'])} {CURRENCY}")
         return
     if await get_game(m.from_user.id):
         await add_balance(m.from_user.id, bet)
-        await m.reply("🎮 Ты уже играешь!")
+        await safe_reply(m, "🎮 Ты уже играешь!")
         return
 
     await stat_bet(m.from_user.id, bet)
     state = mines_new_state(MINES_COUNT, bet)
     await save_game(m.from_user.id, "mines", bet, state)
-    await m.reply(
+    await safe_reply(
+        m,
         f"💣 <b>@{m.from_user.username or m.from_user.first_name}</b> "
         f"ставит <b>{fmt(bet)} {CURRENCY}</b>\n\n" + mines_text(state),
         reply_markup=mines_kb(m.from_user.id, state))
@@ -1330,16 +1378,16 @@ async def chat_mines(m: Message, args: list[str]):
 
 async def chat_case(m: Message, args: list[str]):
     if not args:
-        await m.reply("🎁 Формат: <code>кейс золото</code>")
+        await safe_reply(m, "🎁 Формат: <code>кейс золото</code>")
         return
     case_key = CASE_ALIASES.get(args[0].lower())
     if not case_key:
-        await m.reply("🎁 Доступные кейсы: бронза / серебро / золото")
+        await safe_reply(m, "🎁 Доступные кейсы: бронза / серебро / золото")
         return
     c = CASES[case_key]
     ok = await try_deduct_balance(m.from_user.id, c["price"])
     if not ok:
-        await m.reply(f"💸 {c['name']} стоит {fmt(c['price'])} {CURRENCY}")
+        await safe_reply(m, f"💸 {c['name']} стоит {fmt(c['price'])} {CURRENCY}")
         return
     await stat_bet(m.from_user.id, c["price"])
     prize = open_case(case_key)
@@ -1348,9 +1396,10 @@ async def chat_case(m: Message, args: list[str]):
         await stat_win(m.from_user.id, prize - c["price"])
         result = f"{e('trophy', '🎉')} Выпало <b>{fmt(prize)} {CURRENCY}</b>!\n└ Жирно насыпало! {e('greedy', '🤑')}"
     else:
-        result = f"{e('skull', '💀')} <b>ПУСТО</b>"
+        result = "💀 <b>ПУСТО</b>"
     new_bal = (await get_user(m.from_user.id))["balance"]
-    await m.reply(
+    await safe_reply(
+        m,
         f"🎁 <b>@{m.from_user.username or m.from_user.first_name}</b> "
         f"открывает {c['name']} за {fmt(c['price'])} {CURRENCY}\n\n{result}\n\n"
         f"{e('bag', '💼')} Баланс: <b>{fmt(new_bal)} {CURRENCY}</b>")
@@ -1358,16 +1407,16 @@ async def chat_case(m: Message, args: list[str]):
 
 async def chat_dice(m: Message, args: list[str]):
     if not args or not args[0].isdigit():
-        await m.reply("🎲 Формат: <code>кости 500</code>")
+        await safe_reply(m, "🎲 Формат: <code>кости 500</code>")
         return
     bet = int(args[0])
     if bet < 50:
-        await m.reply(f"🎲 Минимум 50 {CURRENCY}")
+        await safe_reply(m, f"🎲 Минимум 50 {CURRENCY}")
         return
 
     ok = await try_deduct_balance(m.from_user.id, bet)
     if not ok:
-        await m.reply(f"💸 Не хватает {CURRENCY} для ставки!")
+        await safe_reply(m, f"💸 Не хватает {CURRENCY} для ставки!")
         return
 
     await stat_bet(m.from_user.id, bet)
@@ -1402,7 +1451,7 @@ async def chat_dice(m: Message, args: list[str]):
             f"💵 Ставка <b>{fmt(bet)} {CURRENCY}</b> возвращена!"
         )
 
-    await m.reply(f"{e('dice', '🎲')} <b>КОСТИ (SCREAMSOON)</b>\n\n{res}")
+    await safe_reply(m, f"{e('dice', '🎲')} <b>КОСТИ (SCREAMSOON)</b>\n\n{res}")
 
 
 # ==================== КОМАНДА /PAY ====================
@@ -1413,31 +1462,31 @@ async def cmd_pay(m: Message):
         return
     parts = (m.text or "").split()
     if len(parts) != 3 or not parts[2].isdigit():
-        await m.answer(f"Формат: <code>/pay @ник сумма</code>")
+        await safe_answer(m, f"Формат: <code>/pay @ник сумма</code>")
         return
     target_username = parts[1].lstrip("@")
     amount = int(parts[2])
     if amount <= 0:
-        await m.answer("Сумма должна быть > 0.")
+        await safe_answer(m, "Сумма должна быть > 0.")
         return
 
     ok = await try_deduct_balance(m.from_user.id, amount)
     if not ok:
-        await m.answer(f"❌ Недостаточно {CURRENCY}.")
+        await safe_answer(m, f"❌ Недостаточно {CURRENCY}.")
         return
 
     target = await find_user_by_username(target_username)
     if not target:
         await add_balance(m.from_user.id, amount)
-        await m.answer("❌ Получатель не найден (ему нужно хотя бы раз открыть бота).")
+        await safe_answer(m, "❌ Получатель не найден (ему нужно хотя бы раз открыть бота).")
         return
     if target["user_id"] == m.from_user.id:
         await add_balance(m.from_user.id, amount)
-        await m.answer("Себе переводить нельзя!")
+        await safe_answer(m, "Себе переводить нельзя!")
         return
 
     await add_balance(target["user_id"], amount)
-    await m.answer(f"{e('check', '✅')} Переведено <b>{fmt(amount)} {CURRENCY}</b> пользователю @{target_username}")
+    await safe_answer(m, f"{e('check', '✅')} Переведено <b>{fmt(amount)} {CURRENCY}</b> пользователю @{target_username}")
 
 
 # ==================== АДМИН-КОМАНДЫ ====================
@@ -1465,11 +1514,11 @@ async def cmd_give(m: Message):
         try:
             amount = int(parts[1])
         except ValueError:
-            await m.answer("Формат: реплай + <code>/give 5000</code>")
+            await safe_answer(m, "Формат: реплай + <code>/give 5000</code>")
             return
         await get_user(target.id, target.username, target.first_name)
         await add_balance(target.id, amount)
-        await m.answer(f"✅ @{target.username or target.first_name}: <b>{amount:+}</b> {CURRENCY}")
+        await safe_answer(m, f"✅ @{target.username or target.first_name}: <b>{amount:+}</b> {CURRENCY}")
         try:
             await bot.send_message(target.id, f"💰 Администратор начислил тебе <b>{fmt(amount)} {CURRENCY}</b>")
         except Exception:
@@ -1477,7 +1526,8 @@ async def cmd_give(m: Message):
         return
 
     if len(parts) != 3:
-        await m.answer(
+        await safe_answer(
+            m,
             f"Формат:\n"
             f"└ <code>/give user_id 5000</code>\n"
             f"└ <code>/give @username 5000</code>\n"
@@ -1485,16 +1535,16 @@ async def cmd_give(m: Message):
         return
     target_id = await resolve_target_id(parts[1])
     if not target_id:
-        await m.answer("❌ Юзер не найден")
+        await safe_answer(m, "❌ Юзер не найден")
         return
     try:
         amount = int(parts[2])
     except ValueError:
-        await m.answer("Сумма должна быть числом")
+        await safe_answer(m, "Сумма должна быть числом")
         return
     await get_user(target_id)
     await add_balance(target_id, amount)
-    await m.answer(f"✅ {target_id}: <b>{amount:+}</b> {CURRENCY}")
+    await safe_answer(m, f"✅ {target_id}: <b>{amount:+}</b> {CURRENCY}")
     try:
         await bot.send_message(target_id, f"💰 Администратор начислил тебе <b>{fmt(amount)} {CURRENCY}</b>")
     except Exception:
@@ -1507,20 +1557,20 @@ async def cmd_takebal(m: Message):
         return
     parts = (m.text or "").split()
     if len(parts) != 3:
-        await m.answer("Формат: <code>/takebal user_id сумма</code>")
+        await safe_answer(m, "Формат: <code>/takebal user_id сумма</code>")
         return
     target_id = await resolve_target_id(parts[1])
     if not target_id:
-        await m.answer("❌ Юзер не найден")
+        await safe_answer(m, "❌ Юзер не найден")
         return
     try:
         amount = int(parts[2])
     except ValueError:
-        await m.answer("Сумма — число")
+        await safe_answer(m, "Сумма — число")
         return
     await get_user(target_id)
     await add_balance(target_id, -amount)
-    await m.answer(f"✅ {target_id}: <b>-{amount}</b> {CURRENCY}")
+    await safe_answer(m, f"✅ {target_id}: <b>-{amount}</b> {CURRENCY}")
 
 
 @dp.message(Command("setbal"))
@@ -1529,20 +1579,20 @@ async def cmd_setbal(m: Message):
         return
     parts = (m.text or "").split()
     if len(parts) != 3:
-        await m.answer("Формат: <code>/setbal user_id сумма</code>")
+        await safe_answer(m, "Формат: <code>/setbal user_id сумма</code>")
         return
     target_id = await resolve_target_id(parts[1])
     if not target_id:
-        await m.answer("❌ Юзер не найден")
+        await safe_answer(m, "❌ Юзер не найден")
         return
     try:
         amount = int(parts[2])
     except ValueError:
-        await m.answer("Сумма — число")
+        await safe_answer(m, "Сумма — число")
         return
     await get_user(target_id)
     await set_balance(target_id, amount)
-    await m.answer(f"✅ {target_id} = <b>{fmt(amount)}</b> {CURRENCY}")
+    await safe_answer(m, f"✅ {target_id} = <b>{fmt(amount)}</b> {CURRENCY}")
 
 
 @dp.message(Command("giveall"))
@@ -1551,15 +1601,15 @@ async def cmd_giveall(m: Message):
         return
     parts = (m.text or "").split()
     if len(parts) != 2:
-        await m.answer("Формат: <code>/giveall сумма</code>")
+        await safe_answer(m, "Формат: <code>/giveall сумма</code>")
         return
     try:
         amount = int(parts[1])
     except ValueError:
-        await m.answer("Сумма — число")
+        await safe_answer(m, "Сумма — число")
         return
     n = await give_all(amount)
-    await m.answer(f"✅ Всем <b>{n}</b> юзерам начислено: <b>{amount:+}</b> {CURRENCY}")
+    await safe_answer(m, f"✅ Всем <b>{n}</b> юзерам начислено: <b>{amount:+}</b> {CURRENCY}")
 
 
 # ==================== ПРОВЕРКА ПОДПИСКИ ПО КНОПКЕ ====================
